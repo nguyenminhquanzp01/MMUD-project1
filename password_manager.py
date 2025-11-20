@@ -54,10 +54,27 @@ class Keychain:
     ) -> "Keychain":
         """
         Loads Keychain from saved representation.
+
+        Args:
+            keychain_password: the password to unlock the keychain
+            repr: a JSON-encoded serialization of the contents of the key-value store (string)
+            trusted_data_check: an optional SHA-256 checksum of the KVS (bytes or None)
+        Returns:
+            A Keychain instance containing the data from repr
+        Throws:
+            ValueError: if the checksum is provided in trusted_data_check and the checksum check fails
+            ValueError: if the provided keychain password is not correct for the repr (hint: this is
+                thrown for you by HMAC.verify)
         """
         data = json_str_to_dict(repr)
         salt = decode_bytes(data["salt"])
-        kvs = data["kvs"]
+        kvs = data.get("kvs", {})
+
+        # Optional integrity check against trusted_data_check
+        if trusted_data_check:
+            check = SHA256.new(str_to_bytes(repr)).digest()
+            if check != trusted_data_check:
+                raise ValueError("Checksum mismatch")
 
         # Regenerate keys using password and salt
         derived_key = PBKDF2(
@@ -72,14 +89,22 @@ class Keychain:
         key_mac = HMAC.new(derived_key, b"mac key", SHA256).digest()
         key_enc = HMAC.new(derived_key, b"enc key", SHA256).digest()
 
-        # Optional integrity check
-        if trusted_data_check:
-            check = SHA256.new(str_to_bytes(repr)).digest()
-            if check != trusted_data_check:
-                raise ValueError("Checksum mismatch")
+        # Verify provided password is correct by attempting to decrypt one stored entry (if any).
+        # If decryption or tag verification fails, AES will raise a ValueError which we surface.
+        if kvs:
+            # take the first stored entry to test decryption
+            first_entry = next(iter(kvs.values()))
+            try:
+                nonce = decode_bytes(first_entry["nonce"])
+                ciphertext = decode_bytes(first_entry["ciphertext"])
+                tag = decode_bytes(first_entry["tag"])
 
-        # Test password correctness by verifying domain HMAC or try a dummy decryption
-        # (Here we trust correct password -> valid derived key)
+                cipher = AES.new(key_enc, AES.MODE_GCM, nonce=nonce)
+                # decrypt_and_verify will raise ValueError if authentication fails (wrong key/password)
+                cipher.decrypt_and_verify(ciphertext, tag)
+            except ValueError:
+                raise ValueError("Incorrect password or corrupted data")
+
         return Keychain(kvs, salt, key_enc, key_mac)
 
     def dump(self) -> Tuple[str, bytes]:
